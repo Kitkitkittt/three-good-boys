@@ -598,6 +598,50 @@ class ApiLifecycleTests(unittest.TestCase):
         self.assertEqual(self.api.get_artifacts(self.run.run_id), ())
         self.assertEqual(self.repository.get_slot().holder, self.run.run_id)
 
+    def test_claim_slot_is_all_or_nothing_with_an_unwritable_spec(self):
+        from lifemate_cloud.batch import BatchJobSpec
+        from lifemate_cloud.errors import Conflict
+
+        class FrozenSpecs(InMemoryApiRepository):
+            def put_batch_spec(self, spec):
+                raise RuntimeError("spec write failed")
+
+        runs = FrozenSpecs()
+        repository = DispatcherRepository(runs)
+        repository.put_run(self.run)
+        spec = BatchJobSpec.for_attempt(self.run.run_id, 1, self.run.request_fingerprint)
+        with self.assertRaises(RuntimeError):
+            repository.claim_slot(self.run.run_id, 100, spec,
+                                  RunOp(run_id=self.run.run_id, attempt=1, job_id=spec.job_id,
+                                        request_id=spec.request_id))
+        self.assertTrue(repository.get_slot().is_free)
+        self.assertEqual(repository.all_ops(), [])
+
+    def test_two_claims_on_the_real_store_admit_one(self):
+        from lifemate_cloud.batch import BatchJobSpec
+        from lifemate_cloud.errors import Conflict
+
+        spec = BatchJobSpec.for_attempt(self.run.run_id, 1, self.run.request_fingerprint)
+        record = RunOp(run_id=self.run.run_id, attempt=1, job_id=spec.job_id,
+                       request_id=spec.request_id)
+        self.repository.claim_slot(self.run.run_id, 100, spec, record)
+        with self.assertRaises(Conflict):
+            self.repository.claim_slot(self.run.run_id, 100, spec, record)
+        self.assertEqual(self.repository.all_ops(), [record])
+        self.assertEqual(self.api.get_batch_spec(self.run.run_id, 1), spec)
+
+    def test_sweep_repairs_an_api_accepted_run_with_a_lost_task(self):
+        """Acceptance stops before the task: the sweep admits and re-issues it."""
+        service = DispatchService(
+            self.repository, self.batch, self.queue, self.clock, self.artifacts,
+            manifests=self.manifests, policy=DispatchPolicy(budget=10_000),
+        )
+        self.assertEqual(self.repository.all_ops(), [])
+        results = service.sweep()
+        self.assertEqual(results, {self.run.run_id: RunOpState.ACTIVE.value})
+        self.assertEqual(self.queue.sent[-1], self.run.run_id)
+        self.assertEqual(self.repository.get_slot().holder, self.run.run_id)
+
 
 class BatchProtoShapeTests(unittest.TestCase):
     """The CreateJob payload must match the installed ``google-cloud-batch``.

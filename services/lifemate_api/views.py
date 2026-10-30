@@ -19,6 +19,7 @@ import json
 _REDACTED = {
     "batch_create_failed": "the GPU job could not be created",
     "batch_failed": "the GPU job reported a failure",
+    "BATCH_FAILED": "the GPU job reported a failure",
     "deadline_exceeded": "the run exceeded its deadline",
     "manifest_incomplete": "results were incomplete",
     "manifest_conflict": "results conflicted with a pinned object",

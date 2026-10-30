@@ -10,8 +10,34 @@ A production adapter swaps this class for Firestore and keeps exactly these
 methods.
 """
 import dataclasses
+import threading
+
+from lifemate_cloud.errors import Conflict
 
 from .records import Admission, AdmissionSlot, RunOp, RunOpState
+
+
+def _slot_document(slot):
+    """The stored shape of the singleton slot, shared by both adapters."""
+    return {
+        "holder": slot.holder,
+        "reservation": dataclasses.asdict(slot.reservation) if slot.reservation else None,
+        "release_verified": slot.release_verified,
+        "evidence": slot.evidence,
+        "alerts": list(slot.alerts),
+    }
+
+
+def _spec_document(spec):
+    """The pinned Batch identity, in the API's ``batch_specs`` layout."""
+    return {
+        "job_id": spec.job_id,
+        "request_id": spec.request_id,
+        "run_id": spec.run_id,
+        "attempt": spec.attempt,
+        "request_fingerprint": spec.request_fingerprint,
+        "retry_count": spec.retry_count,
+    }
 
 
 class DispatcherRepository:
@@ -23,6 +49,9 @@ class DispatcherRepository:
         self._uid_index = {}
         self._events = []
         self._slot = AdmissionSlot()
+        # Admission reads the slot and writes slot+spec+op; the lock makes that
+        # one unit so two deliveries cannot both observe a free slot.
+        self._lock = threading.Lock()
 
     # -- shared records (tickets 15/16) -----------------------------------
 
@@ -88,6 +117,23 @@ class DispatcherRepository:
     def put_slot(self, slot):
         self._slot = slot
 
+    def claim_slot(self, run_id, cost, spec, op, run=None, currency="USD-cents"):
+        """Read-check-write admission in one unit; returns the claimed slot.
+
+        ``run`` is the post-acceptance run record. It is committed after the
+        slot rather than inside the lock: the admission itself is the slot,
+        spec and op, which a crash can never leave half-written.
+        """
+        with self._lock:
+            if not self._slot.is_free:
+                raise Conflict(f"GPU slot is held by {self._slot.holder!r}; queue is not a GPU control")
+            self._runs.put_batch_spec(spec)
+            self._slot = self._slot.claim(run_id, cost, currency)
+            self._ops[op.run_id] = op
+        if run is not None:
+            self._runs.put_run(run)
+        return self._slot
+
     def get_job_uid_index(self, job_id):
         return self._uid_index.get(job_id)
 
@@ -127,6 +173,17 @@ class FirestoreDispatcherRepository:
         self._uids = client.collection("job_uids")
         self._slot_document = client.collection("dispatch_slot").document("singleton")
         self._events = client.collection("dispatch_events")
+        # Same decorator seam as the API repository: tests inject it so no
+        # Google client is imported.
+        self._transactional = getattr(runs, "_transactional", None)
+
+    def _decorate(self, callback):
+        decorate = self._transactional
+        if decorate is None:
+            from google.cloud import firestore  # imported lazily
+
+            decorate = firestore.transactional
+        return decorate(callback)
 
     # -- shared records (tickets 15/16): one layout, read through `runs` -----
 
@@ -186,14 +243,34 @@ class FirestoreDispatcherRepository:
         return self._slot_from(snapshot.to_dict()) if snapshot.exists else AdmissionSlot()
 
     def put_slot(self, slot):
-        self._slot_document.set({
-            "holder": slot.holder,
-            "reservation": dataclasses.asdict(slot.reservation) if slot.reservation else None,
-            "release_verified": slot.release_verified,
-            "evidence": slot.evidence,
-            "alerts": list(slot.alerts),
-        })
+        self._slot_document.set(_slot_document(slot))
         return slot
+
+    def claim_slot(self, run_id, cost, spec, op, run=None, currency="USD-cents"):
+        """Single transaction: read the slot, write spec, op and holder.
+
+        The transaction is the guarantee; a second delivery's read sees the
+        committed holder, or its commit is retried against the winner. No Cloud
+        Tasks or Batch call is made here.
+        """
+        spec_document = self._runs._specs.document(f"{spec.run_id}:{spec.attempt}")
+        claimed = {}
+
+        @self._decorate
+        def _commit(transaction):
+            snapshot = transaction.get(self._slot_document)
+            slot = self._slot_from(snapshot.to_dict()) if snapshot.exists else AdmissionSlot()
+            if not slot.is_free:
+                raise Conflict(f"GPU slot is held by {slot.holder!r}; queue is not a GPU control")
+            claimed["slot"] = slot.claim(run_id, cost, currency)
+            transaction.set(spec_document, _spec_document(spec))
+            transaction.set(self._ops.document(op.run_id), dataclasses.asdict(op))
+            transaction.set(self._slot_document, _slot_document(claimed["slot"]))
+
+        _commit(self._client.transaction())
+        if run is not None:
+            self.put_run(run)
+        return claimed["slot"]
 
     def get_job_uid_index(self, job_id):
         snapshot = self._uids.document(job_id).get()

@@ -21,6 +21,13 @@ def create_app(service):
             return JSONResponse(status_code=400, content={"code": "bad_request"})
         return JSONResponse(status_code=status, content=body)
 
+
+    @application.get("/healthz")
+    def healthz():
+        # Liveness only: the revision must become ready before any cloud client
+        # is reachable, so this touches no service and no dependency.
+        return JSONResponse(status_code=200, content={"status": "ok"})
+
     @application.post("/internal/dispatch")
     def dispatch(payload: dict):
         if not isinstance(payload.get("run_id"), str) or not payload["run_id"]:

@@ -3,6 +3,7 @@
 Each test names the fault it injects and the held state it expects. No Google
 client is imported: the seams are the fakes below.
 """
+import threading
 import unittest
 
 from lifemate_cloud.artifacts import InMemoryArtifactStore
@@ -11,11 +12,13 @@ from lifemate_cloud.manifest import ManifestEntry, ResultManifest
 from lifemate_cloud.requests import RunRequest
 from lifemate_cloud.run import Run, RunState
 
+from dispatcher.service import DispatchPolicy, DispatchService
 from dispatcher.errors import AmbiguousOutcome, LedgerOverflow
 from dispatcher.http import handle_dispatch, handle_reconcile, status_for
-from dispatcher.records import RunOpState
-from dispatcher.service import DispatchPolicy, DispatchService
+from dispatcher.records import RunOp, RunOpState
 from dispatcher.store import DispatcherRepository, InMemoryManifestStore
+
+from lifemate_api.views import redact
 
 
 def request(**overrides):
@@ -387,7 +390,138 @@ class SuccessTests(unittest.TestCase):
         op = service.reconcile(run.run_id)
         self.assertEqual(op.state, RunOpState.FAILED)
         self.assertEqual(repository.get_run(run.run_id).state, RunState.FAILED)
-        self.assertEqual(repository.get_slot().holder, run.run_id)  # held for release review
+
+
+class ConcurrentAdmissionTests(unittest.TestCase):
+    """Ticket 17: two deliveries race; exactly one may hold the slot."""
+
+    def torn_harness(self):
+        service, repository, artifacts, manifests, clock, batch, queue, run = harness()
+        repository.put_run(Run(run_id="run-2", owner="bob", request_fingerprint="e" * 64))
+
+        class TearingRuns(FakeRuns):
+            """The op write lands, the spec write fails: a crash mid-admission."""
+
+            def put_batch_spec(self, spec):
+                raise RuntimeError("crash between reserve and op")
+
+        runs = TearingRuns()
+        torn = DispatchService(DispatcherRepository(runs), batch, queue, clock, artifacts)
+        torn.repository.put_run(run)
+        runs.put_request(run.run_id, {"accepted_at": clock.now(), "deadline_seconds": 100})
+        return torn
+
+    def test_two_concurrent_deliveries_admit_one_run(self):
+        service, repository, artifacts, manifests, clock, batch, queue, run = harness()
+        repository.put_run(Run(run_id="run-2", owner="bob", request_fingerprint="e" * 64))
+        service.repository._runs.put_request(
+            "run-2", {"accepted_at": clock.now(), "deadline_seconds": 100}
+        )
+        outcomes = {}
+        start = threading.Barrier(2)
+
+        def admit(run_id):
+            start.wait()
+            try:
+                outcomes[run_id] = service.accept(run_id, 100).run_id
+            except Conflict as exc:
+                outcomes[run_id] = exc
+
+        threads = [threading.Thread(target=admit, args=(run_id,)) for run_id in ("run-1", "run-2")]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        winners = [run_id for run_id, result in outcomes.items() if result == run_id]
+        losers = [result for result in outcomes.values() if isinstance(result, Conflict)]
+        self.assertEqual(len(winners), 1, outcomes)
+        self.assertEqual(len(losers), 1, outcomes)
+        self.assertEqual(len(repository.all_ops()), 1)
+        self.assertEqual(repository.get_op(winners[0]).run_id, winners[0])
+        self.assertEqual(repository.get_slot().holder, winners[0])
+        self.assertEqual(repository.get_slot().reservation.cost, 100)
+
+    def test_crash_between_reserve_and_op_leaves_no_half_state(self):
+        torn = self.torn_harness()
+        with self.assertRaises(RuntimeError):
+            torn.accept("run-1", 100)
+        self.assertEqual(torn.repository.all_ops(), [])
+        self.assertTrue(torn.repository.get_slot().is_free)
+        self.assertIsNone(torn.repository.get_slot().reservation)
+
+
+class SweepTests(unittest.TestCase):
+    """Ticket 17: the sweep adopts API-accepted runs with no dispatcher op."""
+
+    def test_accepted_run_without_an_op_is_enqueued_by_an_empty_sweep(self):
+        service, repository, artifacts, manifests, clock, batch, queue, run = harness()
+        # API acceptance only: a run and its pinned request; the task was lost.
+        self.assertEqual(repository.all_ops(), [])
+        code, body = handle_reconcile(service, {})
+        self.assertEqual(code, 200)
+        self.assertEqual(set(body["runs"]), {run.run_id})
+        # Admitted once (which enqueues) and then reconciled: a lost task is
+        # retried, never admits a second job for the same run.
+        self.assertEqual(queue.calls, [run.run_id, run.run_id])
+        self.assertEqual(len(repository.all_ops()), 1)
+        self.assertEqual(repository.get_op(run.run_id).state, RunOpState.ACCEPTED)
+        self.assertEqual(repository.get_slot().holder, run.run_id)
+        # No network create during admission: the task performs it.
+        self.assertEqual(batch.creates, [])
+
+    def test_one_failing_run_does_not_abort_the_sweep(self):
+        service, repository, artifacts, manifests, clock, batch, queue, run = harness()
+        service.accept(run.run_id, 100, enqueue=False)
+        service.dispatch(run.run_id)
+        # A second op whose Batch read raises; the sweep must still reconcile run-1.
+        repository._runs.put_request("run-2", {"accepted_at": clock.now(), "deadline_seconds": 100})
+        repository.put_op(RunOp(run_id="run-2", attempt=1, job_id="job-broken",
+                                request_id="r2", state=RunOpState.ACTIVE))
+
+        def get_job(job_id):
+            if job_id == "job-broken":
+                raise RuntimeError("batch unavailable")
+            return dict(batch.jobs[job_id])
+
+        batch.get_job = get_job
+        code, body = handle_reconcile(service, {})
+        self.assertEqual(code, 200)
+        self.assertEqual(body["runs"]["run-2"].split(":", 1)[0], "RUNTIMEERROR")
+        self.assertEqual(body["runs"][run.run_id], RunOpState.ACTIVE.value)
+
+
+class ReasonCodeTests(unittest.TestCase):
+    """The failure reason is CODE[: detail]; the API view redacts against it."""
+
+    def test_failed_batch_run_returns_the_code_and_a_redacted_detail(self):
+        service, repository, artifacts, manifests, clock, batch, queue, run = harness()
+        service.accept(run.run_id, 100)
+        service.dispatch(run.run_id)
+        batch.jobs[repository.get_op(run.run_id).job_id]["state"] = "FAILED"
+        service.reconcile(run.run_id)
+        reason = repository.get_run(run.run_id).failure_reason
+        self.assertEqual(reason, "BATCH_FAILED: batch FAILED")
+        self.assertEqual(redact(reason),
+                         {"code": "BATCH_FAILED", "summary": "the GPU job reported a failure"})
+
+    def test_unverified_artifacts_use_the_code_not_free_text(self):
+        service, repository, artifacts, manifests, clock, batch, queue, run = harness()
+        reach_succeeded(service, repository, batch, run)
+        op = service.reconcile(run.run_id)
+        self.assertEqual(op.state, RunOpState.FAILED)
+        reason = repository.get_run(run.run_id).failure_reason
+        self.assertEqual(reason, "INCOMPLETEMANIFEST: incompletemanifest")
+        self.assertNotIn("result manifest", redact(reason)["summary"])
+
+    def test_deadline_reason_carries_the_code(self):
+        service, repository, artifacts, manifests, clock, batch, queue, run = harness()
+        service.accept(run.run_id, 100)
+        service.dispatch(run.run_id)
+        clock.advance(101)
+        service.enforce_deadline(run.run_id)
+        self.assertEqual(redact(repository.get_run(run.run_id).failure_reason)["code"],
+                         "DEADLINE_EXCEEDED")
 
 
 class DeadlineTests(unittest.TestCase):

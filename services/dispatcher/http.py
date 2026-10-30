@@ -37,17 +37,10 @@ def handle_reconcile(service, body):
         op = service.enforce_deadline(run_id)
         op = service.reconcile(run_id)
         return 200, {"run_id": run_id, "state": op.state.value, "phase": op.batch_phase}
-    # Scheduler sweep: every recorded op takes the same deadline-then-reconcile
-    # path as an explicit run, so a pre-deadline job that already finished (or
-    # failed) is settled without waiting for its deadline. Both service calls
-    # are safe on every state: ``enforce_deadline`` is a no-op when unexpired,
-    # and ``reconcile`` returns early for ACCEPTED and for terminal ops.
-    results = {}
-    for op in service.repository.all_ops():
-        current = service.enforce_deadline(op.run_id)
-        current = service.reconcile(op.run_id) if current.state is op.state else current
-        results[current.run_id] = current.state.value
-    return 200, {"runs": results}
+    # Scheduler sweep: adopt API-only accepted runs (a lost dispatch task) and
+    # settle every live op before its deadline if Batch is already done.
+    # Per-run isolation and reporting live in ``service.sweep``.
+    return 200, {"runs": service.sweep()}
 
 
 def _json(body):

@@ -10,15 +10,17 @@ The rules this module exists to enforce (plan §4 "Durable lifecycle"):
   cancel holds the slot and alerts;
 * ``SUCCEEDED`` requires Batch success *and* a manifest that verifies complete
   coverage — exit code or a partially written result is not success.
+
+Failure reasons the dispatcher writes into the shared ``Run`` are ``CODE:
+detail``; the API view redacts them against its fixed code table.
 """
 import dataclasses
 
 from lifemate_cloud.batch import BatchJobSpec
 from lifemate_cloud.errors import Conflict, IncompleteManifest, InvalidTransition, ManifestConflict
-
 from lifemate_cloud.run import RunState
 
-from .errors import AmbiguousOutcome, LedgerOverflow
+from .errors import AmbiguousOutcome, LedgerOverflow, code_for
 from .records import AdmissionSlot, RunOp, RunOpState
 from .store import InMemoryManifestStore
 
@@ -58,7 +60,9 @@ class DispatchService:
         """Atomically claim the singleton slot + budget and persist create intent.
 
         No network happens here: the enqueue and the Batch create are separate
-        steps so a crash between them is repairable.
+        steps so a crash between them is repairable. The read-check-write of the
+        slot is one repository unit (``claim_slot``), so two concurrent
+        deliveries cannot both see a free slot.
         """
         if isinstance(cost, bool) or not isinstance(cost, int) or cost < 0:
             raise ValueError("cost must be a non-negative int")
@@ -81,19 +85,31 @@ class DispatchService:
             raise LedgerOverflow(f"cost {cost} exceeds the admitted budget {self.policy.budget}")
 
         # The create intent is committed before any call that may be observed
-        # after a crash, and the ledger is charged in the same step.
+        # after a crash, and the ledger is charged in the same unit.
         spec = BatchJobSpec.for_attempt(run_id, attempt, run.request_fingerprint)
-        self.repository.put_batch_spec(spec)
-        slot = slot.claim(run_id, cost, self.policy.currency)
-        self.repository.put_slot(slot)
         op = RunOp(run_id=run_id, attempt=attempt, job_id=spec.job_id, request_id=spec.request_id)
-        self.repository.put_op(op)
+        submitted = run.transition(RunState.SUBMITTING) if run.state is RunState.QUEUED else None
+        try:
+            self.repository.claim_slot(run_id, cost, spec, op, run=submitted,
+                                       currency=self.policy.currency)
+        except Conflict:
+            raise
+        except Exception as exc:
+            # The repository is responsible for all-or-nothing writes; this
+            # keeps the recorded reason a code even if an adapter breaks that.
+            self.repository.put_run(self._fail_run(run_id, f"{code_for(exc)}: admission failed"))
+            raise
+        # Stamped before any enqueue can fail: a task redelivered to this
+        # instance finds the acceptance recorded and never re-enqueues.
         self._accepted_at[run_id] = self.clock.now()
         self.repository.audit(run_id, "accepted", {"job_id": spec.job_id, "cost": cost})
-        if run.state is RunState.QUEUED:
-            self.repository.put_run(run.transition(RunState.SUBMITTING))
         if enqueue:
-            self.queue.enqueue_dispatch(run_id)
+            try:
+                self.queue.enqueue_dispatch(run_id)
+            except Exception as exc:
+                # The op is ACCEPTED and durable; the repair pass and the sweep
+                # re-issue the task rather than failing a committed admission.
+                self.repository.audit(run_id, "enqueue_lost", {"error": str(exc)})
         return op
 
     # -- create ------------------------------------------------------------
@@ -136,10 +152,14 @@ class DispatchService:
         """Read the real Batch state, repair the enqueue, enforce the deadline."""
         op = self.repository.get_op(run_id)
         # A create that was never confirmed is a lost enqueue, not a reason to
-        # make a second job: repair it through the reconciler.
+        # make a second job: re-issue the dispatch task when it was lost. An op
+        # that already exists means the task arrived and died here, so finish
+        # the create with the same pinned identity.
         if op.state is RunOpState.ACCEPTED:
-            self.queue.enqueue_dispatch(run_id)
-            return op
+            if self.repository.get_intent(run_id, op.attempt) is None:
+                self.queue.enqueue_dispatch(run_id)
+                return op
+            return self.dispatch(run_id)
         if op.state in (RunOpState.SUCCEEDED, RunOpState.FAILED, RunOpState.CANCELED):
             return op
 
@@ -163,11 +183,15 @@ class DispatchService:
         if observed.get("state") in ("FAILED", "CANCELLED", "CANCELED"):
             # Terminal failure, but nobody has reconciled it yet: hold the
             # slot; an operator/reconciler must verify before release.
-            op = op.finish(RunOpState.FAILED, reason=f"batch {observed.get('state')}")
+            state = observed.get("state")
+            reason = f"BATCH_FAILED: batch {state}"
+            op = op.finish(RunOpState.FAILED, reason=reason)
             self.repository.put_op(op)
-            self.repository.put_run(self._fail_run(run_id, f"batch {observed.get('state')}"))
-            self._hold_and_alert(run_id, f"batch terminal {observed.get('state')}; awaiting verified release")
+            self.repository.put_run(self._fail_run(run_id, reason))
+            self._hold_and_alert(run_id, f"batch terminal {state}; awaiting verified release")
             return op
+        if observed.get("state") == "SUCCEEDED":
+            return self._finalize_success(run_id, op)
         return op
 
     def enforce_deadline(self, run_id):
@@ -176,7 +200,7 @@ class DispatchService:
         if deadline is None or self.clock.now() <= deadline:
             return self.repository.get_op(run_id)
         try:
-            self.cancel(run_id, reason="deadline exceeded")
+            self.cancel(run_id, reason="DEADLINE_EXCEEDED: deadline exceeded")
             return self.reconcile(run_id)
         except AmbiguousOutcome:
             # Ambiguous or unverified: the slot stays held for an operator.
@@ -259,6 +283,50 @@ class DispatchService:
         self._hold_and_alert(run_id, f"cancel for {op.job_id} not yet terminal")
         return op
 
+    def sweep(self):
+        """Run the scheduler sweep: adopt API-only accepted runs, reconcile ops.
+
+        A run the API accepted whose dispatch task was lost has a pinned request
+        and no op; admitting it here is what repairs it. Each run is isolated so
+        one failing run never aborts the sweep, and every outcome is reported.
+        """
+        results = {}
+        for run in self._unadmitted_runs():
+            try:
+                self.accept(run.run_id, 0)
+                self.repository.audit(run.run_id, "swept_admission", {})
+                op = self.repository.get_op(run.run_id)
+                results[run.run_id] = op.state.value
+            except Exception as exc:
+                self.repository.audit(run.run_id, "sweep_failed", {"error": str(exc)})
+                results[run.run_id] = f"{code_for(exc)}: {exc}"
+        for op in self.repository.all_ops():
+            try:
+                current = self.enforce_deadline(op.run_id)
+                if current.state is op.state:
+                    current = self.reconcile(op.run_id)
+                results[current.run_id] = current.state.value
+            except Exception as exc:
+                results[op.run_id] = f"{code_for(exc)}: {exc}"
+        return results
+
+    def _unadmitted_runs(self):
+        """Accepted, non-terminal runs with a pinned request and no dispatcher op."""
+        admitted = {op.run_id for op in self.repository.all_ops()}
+        return [
+            run for run in self.repository.all_runs()
+            if run.run_id not in admitted
+            and run.state not in (RunState.SUCCEEDED, RunState.FAILED, RunState.CANCELED)
+            and self._request_or_none(run.run_id) is not None
+        ]
+
+    def _request_or_none(self, run_id):
+        try:
+            return self.repository.get_request(run_id)
+        except (KeyError, TypeError):
+            return None
+
+
     # -- internals ---------------------------------------------------------
 
     def _finalize_success(self, run_id, op):
@@ -271,17 +339,28 @@ class DispatchService:
             self.repository.put_artifacts(run_id, verified.entries)
         except Exception as exc:
             # Batch said success, the artifacts do not back it up.
-            op = op.finish(RunOpState.FAILED, reason=f"artifacts unverified: {exc}")
-            self.repository.put_op(op)
-            self.repository.put_run(self._fail_run(run_id, f"artifacts unverified: {exc}"))
-            self._hold_and_alert(run_id, f"unverified artifacts for {run_id}: {exc}")
-            return op
-        op = op.finish(RunOpState.SUCCEEDED, reason="batch succeeded and manifest verified", manifest_verified=True)
+            return self._fail_and_hold(run_id, op, exc, "unverified artifacts")
+        op = op.finish(RunOpState.SUCCEEDED, reason="SUCCEEDED: manifest verified",
+                       manifest_verified=True)
         self.repository.put_op(op)
         run = self.repository.get_run(run_id)
         if run.state is RunState.ACTIVE:
             self.repository.put_run(run.transition(RunState.SUCCEEDED))
         self._release_verified(run_id, "verified success")
+        return op
+
+    def _fail_and_hold(self, run_id, op, exc, alert):
+        """Terminal failure with an uppercase code; the slot stays held.
+
+        ``failure_reason`` is ``CODE: detail`` so the API view's redaction keeps
+        the fixed summary. The detail is the error type, never its message: a
+        message can name restricted objects or carry a traceback.
+        """
+        reason = f"{code_for(exc)}: {code_for(exc).lower()}"
+        op = op.finish(RunOpState.FAILED, reason=reason)
+        self.repository.put_op(op)
+        self.repository.put_run(self._fail_run(run_id, reason))
+        self._hold_and_alert(run_id, f"{alert} for {run_id}: {exc}")
         return op
 
     def _manifest(self, run_id):
