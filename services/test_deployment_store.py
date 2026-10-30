@@ -903,6 +903,75 @@ class BatchProtoShapeTests(unittest.TestCase):
                 self.assertEqual(observed["state"], expected)
                 self.assertEqual(observed["phase"], name)
 
+    def test_long_run_id_labels_fit_gcp_limit_without_changing_worker_identity(self):
+        from lifemate_cloud.batch import BatchJobSpec
+
+        run_id = "f" * 64
+        spec = BatchJobSpec.for_attempt(run_id, 1, "e" * 64)
+        job = self.api.job_for(spec.job_id, spec.request_id, spec)
+        label = job.labels["run-id"]
+        self.assertLessEqual(len(label), 63)
+        self.assertEqual(job.allocation_policy.labels["run-id"], label)
+        self.assertEqual(self.api.job_for(spec.job_id, spec.request_id, spec).labels["run-id"], label)
+        variables = job.task_groups[0].task_spec.runnables[0].environment.variables
+        self.assertEqual(variables["RUN_ID"], run_id)
+
+    def test_create_without_uid_waits_for_get_before_confirming_identity(self):
+        from dispatcher.errors import AmbiguousOutcome
+        from lifemate_cloud.artifacts import InMemoryArtifactStore
+        from lifemate_cloud.run import RunState
+        from test_api import NOW, SUBMIT, call, harness
+
+        app, runs = harness()
+        response = call(app, "POST", "/api/experiments/exp-1/runs", key="no-uid", body=SUBMIT)
+        self.assertEqual(response.status, 202)
+        run_id = response.json["run_id"]
+        repository = DispatcherRepository(runs)
+        service = DispatchService(repository, self.api, _StubQueue(), _StubClock(NOW.timestamp()),
+                                  InMemoryArtifactStore())
+        service.accept(run_id, 100)
+        op = repository.get_op(run_id)
+        created = self.batch_v1.Job(name="projects/p/locations/asia-southeast1/jobs/" + op.job_id)
+
+        class Client:
+            create_calls = 0
+
+            def create_job(self, request):
+                self.create_calls += 1
+                return created
+
+            def get_job(self, name):
+                return created
+
+        client = Client()
+        self.api._client = client
+        op = service.dispatch(run_id)
+        self.assertEqual(op.state, RunOpState.CREATING)
+        self.assertFalse(op.create_completed)
+        self.assertIsNone(op.batch_uid)
+        self.assertIsNone(repository.get_job_uid_index(op.job_id))
+        self.assertEqual(runs.get_run(run_id).state, RunState.SUBMITTING)
+        self.assertEqual(repository.get_slot().holder, run_id)
+
+        # Even terminal state is insufficient without the real job UID.
+        created.status.state = self.batch_v1.JobStatus.State.SUCCEEDED
+        self.assertEqual(service.reconcile(run_id).state, RunOpState.CREATING)
+        created.uid = "uid-from-get"
+        created.status.state = self.batch_v1.JobStatus.State.RUNNING
+        confirmed = service.reconcile(run_id)
+        self.assertEqual(confirmed.state, RunOpState.ACTIVE)
+        self.assertTrue(confirmed.create_completed)
+        self.assertEqual(confirmed.batch_uid, "uid-from-get")
+        self.assertEqual(repository.get_job_uid_index(op.job_id), "uid-from-get")
+        self.assertEqual(runs.get_run(run_id).state, RunState.ACTIVE)
+        self.assertEqual(client.create_calls, 1)
+
+        created.uid = "replacement-uid"
+        with self.assertRaises(AmbiguousOutcome):
+            service.reconcile(run_id)
+        self.assertEqual(repository.get_op(run_id).batch_uid, "uid-from-get")
+        self.assertEqual(repository.get_slot().holder, run_id)
+
 
     def test_create_returns_name_and_uid_from_the_real_response(self):
         from lifemate_cloud.batch import BatchJobSpec

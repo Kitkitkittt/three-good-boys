@@ -148,16 +148,18 @@ class DispatchService:
             self.repository.put_op(op)
             self._hold_and_alert(run_id, f"ambiguous create for {op.job_id}: {exc}")
             raise AmbiguousOutcome(f"create outcome unknown for {op.job_id}") from exc
-        # A create returns ``(job_name, uid)``; a bare uid from an older adapter
-        # is still accepted. ``uid`` may be empty on the create response even
-        # though the job exists, so only a missing name is ambiguous.
+        # The name locates the job; only its real UID confirms create completion.
+        # In-memory adapters may still return a bare UID.
         name, uid = created if isinstance(created, tuple) else (None, created)
         if not name and not uid:
             self.repository.put_op(op)
             self._hold_and_alert(run_id, f"create returned no job identity for {op.job_id}")
             raise AmbiguousOutcome(f"create returned no job identity for {op.job_id}")
+        if not uid:
+            self._hold_and_alert(run_id, f"create returned no UID for {op.job_id}; awaiting GET")
+            return op
         self.repository.put_job_uid_index(op.job_id, uid)
-        op = op.with_job(uid or name)
+        op = op.with_job(uid)
         self.repository.put_op(op)
         run = self.repository.get_run(run_id)
         if run.state is RunState.SUBMITTING:
@@ -190,9 +192,19 @@ class DispatchService:
                 raise AmbiguousOutcome(f"job {op.job_id} missing")
             # Create has not been confirmed yet: never invent one.
             return op
-        if op.batch_uid is None and observed.get("uid"):
-            self.repository.put_job_uid_index(op.job_id, observed["uid"])
-            op = op.with_job(observed["uid"])
+        uid = observed.get("uid")
+        if not uid:
+            self._hold_and_alert(run_id, f"job {op.job_id} has no UID; awaiting confirmation")
+            return op
+        if op.batch_uid is not None and op.batch_uid != uid:
+            self._hold_and_alert(run_id, f"job {op.job_id} UID changed; slot held")
+            raise AmbiguousOutcome(f"job {op.job_id} UID changed")
+        if op.batch_uid is None:
+            self.repository.put_job_uid_index(op.job_id, uid)
+            op = op.with_job(uid)
+            run = self.repository.get_run(run_id)
+            if run.state is RunState.SUBMITTING:
+                self.repository.put_run(run.transition(RunState.ACTIVE))
         phase = observed.get("phase")
         op = op.with_phase(phase)
         self.repository.put_op(op)

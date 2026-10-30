@@ -128,6 +128,8 @@ The pinned Batch client supports `cancel_job`; it returns a long-running Operati
 
 Batch observations use the SDK enum name, not `str(IntEnum)` (which is numeric). `QUEUED`, `SCHEDULED` and `RUNNING` remain active; `SUCCEEDED`, `FAILED` and `CANCELLED` retain their terminal meanings.
 
+The diagnostic `run-id` labels on the Batch job and allocation policy are truncated deterministically to 63 characters; the pinned spec and worker `RUN_ID` keep the full identity. A create response with a name but no UID leaves the op unconfirmed (`CREATING`) and the slot held. A later GET must provide the real UID before promotion; a changed UID raises ambiguity rather than reconciling a replacement job.
+
 | Incident | Authorized response |
 | --- | --- |
 | API accepted but no job | Inspect persisted run/request/enqueue intent and Tasks/Scheduler delivery; reconcile original identity, do not submit a fresh key. |

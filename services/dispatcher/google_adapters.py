@@ -41,7 +41,8 @@ def build_batch_client(project, region, spec_config, client=None):
             ever declared.
             """
             job = batch_v1.Job()
-            job.labels = {"request-id": request_id, "run-id": spec.run_id}
+            run_label = spec.run_id[:63]  # Diagnostic label only; the worker keeps the full run ID.
+            job.labels = {"request-id": request_id, "run-id": run_label}
             job.task_groups = [self._task_group(spec)]
             allocation = job.allocation_policy
             allocation.service_account = {
@@ -55,7 +56,7 @@ def build_batch_client(project, region, spec_config, client=None):
                     "boot_disk": {"type_": spec_config.boot_disk_type, "size_gb": spec_config.boot_disk_gb},
                 }
             }]
-            allocation.labels = {"run-id": spec.run_id}
+            allocation.labels = {"run-id": run_label}
             return job
 
         def create_job(self, job_id, request_id, spec):
@@ -65,9 +66,8 @@ def build_batch_client(project, region, spec_config, client=None):
             # ``Job.uid`` is output-only and is not a constructor argument; the
             # created job's name is what the API can address afterwards.
             created = self._client.create_job(request=request)
-            # The index is keyed by the full job name and holds the uid, because
-            # ``uid`` may be empty on the create response while ``name`` exists.
-            return created.name or job_id, created.uid or ""
+            # A name is addressable, but only a real UID confirms job identity.
+            return created.name, created.uid or None
 
         def _task_group(self, spec):
             """One foreground task.
