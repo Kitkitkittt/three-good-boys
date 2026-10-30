@@ -120,18 +120,17 @@ class DispatcherRepository:
     def claim_slot(self, run_id, cost, spec, op, run=None, currency="USD-cents"):
         """Read-check-write admission in one unit; returns the claimed slot.
 
-        ``run`` is the post-acceptance run record. It is committed after the
-        slot rather than inside the lock: the admission itself is the slot,
-        spec and op, which a crash can never leave half-written.
+        ``run`` is the post-acceptance run record and shares the locked admission
+        boundary with the spec, op and slot, matching the Firestore transaction.
         """
         with self._lock:
             if not self._slot.is_free:
                 raise Conflict(f"GPU slot is held by {self._slot.holder!r}; queue is not a GPU control")
             self._runs.put_batch_spec(spec)
+            if run is not None:
+                self._runs.put_run(run)
             self._slot = self._slot.claim(run_id, cost, currency)
             self._ops[op.run_id] = op
-        if run is not None:
-            self._runs.put_run(run)
         return self._slot
 
     def get_job_uid_index(self, job_id):
@@ -247,7 +246,7 @@ class FirestoreDispatcherRepository:
         return slot
 
     def claim_slot(self, run_id, cost, spec, op, run=None, currency="USD-cents"):
-        """Single transaction: read the slot, write spec, op and holder.
+        """Single transaction: write the submitting run, spec, op and holder.
 
         The transaction is the guarantee; a second delivery's read sees the
         committed holder, or its commit is retried against the winner. No Cloud
@@ -255,6 +254,7 @@ class FirestoreDispatcherRepository:
         """
         spec_document = self._runs._specs.document(f"{spec.run_id}:{spec.attempt}")
         claimed = {}
+        run_document = self._runs._runs.document(run_id) if run is not None else None
 
         @self._decorate
         def _commit(transaction):
@@ -262,14 +262,17 @@ class FirestoreDispatcherRepository:
             slot = self._slot_from(snapshot.to_dict()) if snapshot.exists else AdmissionSlot()
             if not slot.is_free:
                 raise Conflict(f"GPU slot is held by {slot.holder!r}; queue is not a GPU control")
+            # Read metadata before the first write, as required by Firestore.
+            metadata = run_document.get(transaction=transaction).to_dict() if run_document else None
             claimed["slot"] = slot.claim(run_id, cost, currency)
             transaction.set(spec_document, _spec_document(spec))
             transaction.set(self._ops.document(op.run_id), dataclasses.asdict(op))
             transaction.set(self._slot_document, _slot_document(claimed["slot"]))
+            if run_document is not None:
+                transaction.set(run_document, self._runs._run_to(
+                    run, metadata.get("accepted_at"), metadata.get("deadline_seconds")))
 
         _commit(self._client.transaction())
-        if run is not None:
-            self.put_run(run)
         return claimed["slot"]
 
     def get_job_uid_index(self, job_id):

@@ -270,6 +270,58 @@ class FirestoreTransactionTests(unittest.TestCase):
         with self.assertRaisesRegex(IncompleteManifest, "accepted_at"):
             service._deadline(run_id)
 
+    def test_admission_commit_crash_keeps_submitting_run_recoverable(self):
+        from lifemate_cloud.artifacts import InMemoryArtifactStore
+        from lifemate_cloud.manifest import ManifestEntry, ResultManifest
+        from lifemate_cloud.run import RunState
+        from test_api import NOW
+
+        class ProcessCrash(BaseException):
+            pass
+
+        def crash_after_commit(callback):
+            commit = self.client.transactional(callback)
+
+            def crash(transaction):
+                commit(transaction)
+                raise ProcessCrash()
+
+            return crash
+
+        run_id = self.submit()
+        self.api._transactional = crash_after_commit
+        artifacts = InMemoryArtifactStore()
+        manifests = InMemoryManifestStore()
+        batch = _StubBatch()
+        service = DispatchService(FirestoreDispatcherRepository(self.client, self.api),
+                                  batch, _StubQueue(), _StubClock(NOW.timestamp()),
+                                  artifacts, manifests=manifests)
+        with self.assertRaises(ProcessCrash):
+            service.accept(run_id, 100)
+
+        fresh_api = FirestoreRepository(self.client, transactional=self.client.transactional)
+        repository = FirestoreDispatcherRepository(self.client, fresh_api)
+        self.assertEqual(fresh_api.get_run(run_id).state, RunState.SUBMITTING)
+        self.assertEqual(fresh_api.accepted_at(run_id), NOW.isoformat())
+        self.assertEqual(fresh_api.deadline_seconds(run_id), 300)
+        self.assertEqual(repository.get_slot().holder, run_id)
+        self.assertEqual(repository.get_op(run_id).state, RunOpState.ACCEPTED)
+
+        recovered = DispatchService(repository, batch, _StubQueue(), _StubClock(NOW.timestamp()),
+                                    artifacts, manifests=manifests)
+        self.assertEqual(recovered.dispatch(run_id).state, RunOpState.ACTIVE)
+        self.assertEqual(fresh_api.get_run(run_id).state, RunState.ACTIVE)
+        job_id = repository.get_op(run_id).job_id
+        batch.jobs[job_id].update(state="SUCCEEDED", phase="SUCCEEDED")
+        name, = fresh_api.get_expected_names(run_id)
+        artifacts.put_if_absent(name, b"result")
+        head = artifacts.head(name)
+        manifests.put(ResultManifest.create(run_id, (name,)).add(
+            ManifestEntry(name=name, generation=head.generation, checksum=head.checksum)))
+        self.assertEqual(recovered.reconcile(run_id).state, RunOpState.SUCCEEDED)
+        self.assertEqual(fresh_api.get_run(run_id).state, RunState.SUCCEEDED)
+        self.assertTrue(repository.get_slot().is_free)
+
 
 
 def op(run_id="run-1"):
