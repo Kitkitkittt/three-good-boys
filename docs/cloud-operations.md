@@ -126,6 +126,8 @@ The dispatcher reads accepted time, whole-run deadline and expected output names
 
 The pinned Batch client supports `cancel_job`; it returns a long-running Operation, not a terminal job. The dispatcher requests cancellation and separately re-reads the exact job. Smoke waits for the observed Batch state; it does not claim to await or verify the operation itself. Do not replace cancellation with deletion of the job record.
 
+Batch observations use the SDK enum name, not `str(IntEnum)` (which is numeric). `QUEUED`, `SCHEDULED` and `RUNNING` remain active; `SUCCEEDED`, `FAILED` and `CANCELLED` retain their terminal meanings.
+
 | Incident | Authorized response |
 | --- | --- |
 | API accepted but no job | Inspect persisted run/request/enqueue intent and Tasks/Scheduler delivery; reconcile original identity, do not submit a fresh key. |

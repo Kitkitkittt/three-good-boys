@@ -102,7 +102,7 @@ def build_batch_client(project, region, spec_config, client=None):
                 job = self._client.get_job(name=f"{self._parent}/jobs/{job_id}")
             except gexc.NotFound:
                 return None
-            return {"name": job.name, "uid": job.uid, "phase": str(job.status.state), "state": _state(job)}
+            return {"name": job.name, "uid": job.uid, "phase": job.status.state.name, "state": _state(job)}
 
         def cancel_job(self, job_id):
             from google.api_core import exceptions as gexc
@@ -152,12 +152,10 @@ def batch_config(env):
 
 def _state(job):
     """Map the Batch phase to the four outcomes the dispatcher acts on."""
-    name = str(job.status.state)
-    if name.endswith("SUCCEEDED"):
-        return "SUCCEEDED"
-    if name.endswith(("FAILED", "CANCELLED")):
-        return "FAILED" if name.endswith("FAILED") else "CANCELLED"
-    if name.endswith(("QUEUED", "SCHEDULED", "RUNNING")):
+    name = job.status.state.name
+    if name in ("SUCCEEDED", "FAILED", "CANCELLED"):
+        return name
+    if name in ("QUEUED", "SCHEDULED", "RUNNING"):
         return "ACTIVE"
     return "UNKNOWN"
 

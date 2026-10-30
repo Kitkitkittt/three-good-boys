@@ -885,6 +885,24 @@ class BatchProtoShapeTests(unittest.TestCase):
         self.assertEqual(job.uid, "")
         self.assertEqual(job.name, "")
 
+    def test_real_job_enums_map_to_dispatcher_states(self):
+        for name, expected in (("SUCCEEDED", "SUCCEEDED"), ("FAILED", "FAILED"),
+                               ("CANCELLED", "CANCELLED"), ("RUNNING", "ACTIVE"),
+                               ("QUEUED", "ACTIVE"), ("SCHEDULED", "ACTIVE")):
+            with self.subTest(state=name):
+                state = self.batch_v1.JobStatus.State[name]
+                job = self.batch_v1.Job(status=self.batch_v1.JobStatus(state=state))
+                self.assertEqual(google_adapters._state(job), expected)
+
+                class Client:
+                    def get_job(self, name):
+                        return job
+
+                self.api._client = Client()
+                observed = self.api.get_job("run-job")
+                self.assertEqual(observed["state"], expected)
+                self.assertEqual(observed["phase"], name)
+
 
     def test_create_returns_name_and_uid_from_the_real_response(self):
         from lifemate_cloud.batch import BatchJobSpec
