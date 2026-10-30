@@ -119,7 +119,7 @@ class FirestoreAdapterTests(unittest.TestCase):
             self._store = store
             self._path = path
 
-        def get(self):
+        def get(self, transaction=None):
             return FirestoreAdapterTests._Snapshot(self._store.get(self._path))
 
         def set(self, data):
@@ -143,7 +143,7 @@ class FirestoreAdapterTests(unittest.TestCase):
             self._store = store
 
         def get(self, document):
-            return document.get()
+            yield document.get(transaction=self)
 
         def set(self, document, data):
             document.set(data)
