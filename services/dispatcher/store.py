@@ -258,7 +258,7 @@ class FirestoreDispatcherRepository:
 
         @self._decorate
         def _commit(transaction):
-            snapshot = transaction.get(self._slot_document)
+            snapshot = self._slot_document.get(transaction=transaction)
             slot = self._slot_from(snapshot.to_dict()) if snapshot.exists else AdmissionSlot()
             if not slot.is_free:
                 raise Conflict(f"GPU slot is held by {slot.holder!r}; queue is not a GPU control")

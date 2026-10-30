@@ -301,13 +301,13 @@ class FirestoreRepository:
 
         @self._decorate
         def _commit(transaction):
-            snapshot = transaction.get(idempotency)
+            snapshot = idempotency.get(transaction=transaction)
             if snapshot.exists:
                 data = snapshot.to_dict()
                 if data["fingerprint"] != fingerprint:
                     raise Conflict(
                         f"idempotency key {key!r} was used for a different creation")
-                stored = transaction.get(self._experiments.document(data["experiment_id"]))
+                stored = self._experiments.document(data["experiment_id"]).get(transaction=transaction)
                 if not stored.exists:
                     raise KeyError(data["experiment_id"])
                 winner["instance"] = self._instance_from(stored.to_dict())
@@ -384,7 +384,7 @@ class FirestoreRepository:
         @self._decorate
         def _commit(transaction):
             # Only Firestore writes here; no Cloud Tasks or other network call.
-            snapshot = transaction.get(idempotency)
+            snapshot = idempotency.get(transaction=transaction)
             if snapshot.exists:
                 raise ValueError("acceptance committed twice for the same key")
             transaction.set(idempotency, {"fingerprint": fingerprint, "run_id": run.run_id})

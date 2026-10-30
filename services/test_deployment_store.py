@@ -1,18 +1,20 @@
 """Durable dispatcher persistence and the approved Batch execution contract.
 
-Two production gaps are covered here with fakes only: the Firestore-backed
-dispatcher repository (ops, slot, job-uid index, audit events) and the Batch
-job configuration the adapter renders. No Google client is imported.
+The production Firestore callbacks run against an SDK-faithful in-memory client.
+Optional SDK contract tests also exercise real Firestore and Batch objects;
+neither credentials nor network access are required.
 
 The dispatcher is also built once through ``entry.build_service`` with fake
 Firestore/Batch/Tasks clients and an environment derived from the reviewed
 Terraform variables, so a rename on either side fails loudly here.
 """
+import functools
+import inspect
 import pathlib
 import re
 import unittest
 
-from lifemate_api.store import InMemoryApiRepository
+from lifemate_api.store import FirestoreRepository, InMemoryApiRepository
 from lifemate_cloud.batch import BatchJobConfig, Mount
 from lifemate_cloud.run import Run
 
@@ -30,7 +32,9 @@ class FakeDocument:
         self._store = store
         self._key = key
 
-    def get(self):
+    def get(self, transaction=None):
+        if transaction is not None:
+            transaction.document_reads.append(self._key)
         return FakeSnapshot(self._store.get(self._key))
 
     def set(self, data):
@@ -73,14 +77,47 @@ class FakeCollection(FakeQuery):
         self._docs[f"row-{len(self._docs)}"] = data
 
 
+class FakeTransaction:
+    def __init__(self):
+        self.document_reads = []
+        self._writes = []
+
+    def get(self, document):
+        # The SDK yields snapshots even when given one document reference.
+        yield document.get(transaction=self)
+
+    def set(self, document, data):
+        self._writes.append((document, data))
+
+    def commit(self):
+        for document, data in self._writes:
+            document.set(data)
+
+
 class FakeFirestore:
-    """Minimal Firestore surface: collections, documents, one where clause."""
+    """Firestore documents and buffered transactions, without network calls."""
 
     def __init__(self):
         self._collections = {}
+        self.transactions = []
 
     def collection(self, name):
         return FakeCollection(self._collections.setdefault(name, {}))
+
+    def transaction(self):
+        transaction = FakeTransaction()
+        self.transactions.append(transaction)
+        return transaction
+
+    @staticmethod
+    def transactional(callback):
+        @functools.wraps(callback)
+        def commit(transaction):
+            result = callback(transaction)
+            transaction.commit()
+            return result
+
+        return commit
 
 
 class FakeRuns:
@@ -125,6 +162,73 @@ class FakeRuns:
 
     def all_intents(self):
         return []
+
+class FirestoreTransactionTests(unittest.TestCase):
+    """Run production repository callbacks with the real SDK read contract."""
+
+    def setUp(self):
+        from lifemate_api.app import ApiSettings, create_app
+        from test_api import AUDIENCE, NOW, ROLES, catalog, verifier
+
+        self.client = FakeFirestore()
+        self.api = FirestoreRepository(self.client, transactional=self.client.transactional)
+        self.app = create_app(
+            repository=self.api, verifier=verifier,
+            settings=ApiSettings(iap_audience=AUDIENCE, roles=ROLES, catalog=catalog()),
+            now=lambda: NOW,
+        )
+
+    def submit(self):
+        from test_api import SUBMIT, call
+
+        response = call(self.app, "POST", "/api/experiments/exp-1/runs",
+                        key="run-key", body=SUBMIT)
+        self.assertEqual(response.status, 202, response.json)
+        return response.json["run_id"]
+
+    def test_experiment_creation_and_replay_read_documents_in_transaction(self):
+        from test_api import CREATE, call
+
+        response = call(self.app, "POST", "/api/experiments", key="create-key", body=CREATE)
+        self.assertEqual(response.status, 201, response.json)
+        instance = self.api.get_experiment(response.json["experiment_id"])
+        fingerprint, _ = self.api.creation_record(instance.created_by, "create-key")
+        self.assertEqual(self.api.commit_experiment(
+            instance.created_by, "create-key", fingerprint, instance), instance)
+        self.assertEqual([len(tx.document_reads) for tx in self.client.transactions], [1, 2])
+
+    def test_run_acceptance_reads_document_in_transaction(self):
+        run_id = self.submit()
+        self.assertEqual(self.api.get_run(run_id).state.value, "QUEUED")
+        self.assertEqual(len(self.client.transactions[-1].document_reads), 1)
+
+    def test_slot_claim_reads_document_in_transaction(self):
+        from lifemate_cloud.batch import BatchJobSpec
+
+        run_id = self.submit()
+        repository = FirestoreDispatcherRepository(self.client, self.api)
+        spec = BatchJobSpec.for_attempt(run_id, 1, self.api.get_run(run_id).request_fingerprint)
+        record = RunOp(run_id=run_id, attempt=1, job_id=spec.job_id, request_id=spec.request_id)
+        repository.claim_slot(run_id, 100, spec, record)
+        self.assertEqual(self.client.transactions[-1].document_reads, ["singleton"])
+        self.assertEqual(repository.get_op(run_id), record)
+
+    def test_fake_transaction_get_returns_a_generator(self):
+        snapshots = self.client.transaction().get(self.client.collection("runs").document("absent"))
+        self.assertTrue(inspect.isgenerator(snapshots))
+        self.assertFalse(next(snapshots).exists)
+
+    def test_sdk_transaction_get_returns_a_generator(self):
+        try:
+            from google.auth.credentials import AnonymousCredentials
+            from google.cloud import firestore
+        except ImportError:
+            self.skipTest("google-cloud-firestore is not installed")
+        client = firestore.Client(project="test-project", credentials=AnonymousCredentials())
+        snapshots = client.transaction().get(client.collection("runs").document("absent"))
+        self.assertTrue(inspect.isgenerator(snapshots))
+        snapshots.close()
+
 
 
 def op(run_id="run-1"):
