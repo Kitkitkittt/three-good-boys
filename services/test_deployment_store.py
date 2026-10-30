@@ -229,6 +229,47 @@ class FirestoreTransactionTests(unittest.TestCase):
         self.assertTrue(inspect.isgenerator(snapshots))
         snapshots.close()
 
+    def test_fresh_dispatcher_enforces_http_accepted_iso_deadline(self):
+        from lifemate_cloud.artifacts import InMemoryArtifactStore
+        from lifemate_cloud.run import RunState
+        from test_api import NOW
+
+        run_id = self.submit()
+        self.assertEqual(self.api.accepted_at(run_id), NOW.isoformat())
+        batch = _StubBatch()
+        clock = _StubClock(NOW.timestamp())
+        repository = FirestoreDispatcherRepository(self.client, self.api)
+        service = DispatchService(repository, batch, _StubQueue(), clock, InMemoryArtifactStore())
+        service.accept(run_id, 100)
+        service.dispatch(run_id)
+
+        # A new process has neither the acceptance service nor its fallback clock.
+        fresh_api = FirestoreRepository(self.client, transactional=self.client.transactional)
+        fresh_repository = FirestoreDispatcherRepository(self.client, fresh_api)
+        fresh_service = DispatchService(fresh_repository, batch, _StubQueue(), clock,
+                                        InMemoryArtifactStore())
+        self.assertEqual(fresh_service._accepted_at, {})
+        clock.value += 301
+        op = fresh_service.enforce_deadline(run_id)
+        self.assertEqual(op.state, RunOpState.CANCELED)
+        self.assertEqual(fresh_api.get_run(run_id).state, RunState.CANCELED)
+        self.assertTrue(fresh_repository.get_slot().is_free)
+
+    def test_invalid_persisted_acceptance_time_has_a_clear_error(self):
+        from lifemate_cloud.artifacts import InMemoryArtifactStore
+        from lifemate_cloud.errors import IncompleteManifest
+
+        run_id = self.submit()
+        document = self.client.collection("runs").document(run_id)
+        row = document.get().to_dict()
+        row["accepted_at"] = "not-a-timestamp"
+        document.set(row)
+        service = DispatchService(FirestoreDispatcherRepository(self.client, self.api),
+                                  _StubBatch(), _StubQueue(), _StubClock(0),
+                                  InMemoryArtifactStore())
+        with self.assertRaisesRegex(IncompleteManifest, "accepted_at"):
+            service._deadline(run_id)
+
 
 
 def op(run_id="run-1"):

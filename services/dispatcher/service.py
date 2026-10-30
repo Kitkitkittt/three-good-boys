@@ -15,6 +15,8 @@ Failure reasons the dispatcher writes into the shared ``Run`` are ``CODE:
 detail``; the API view redacts them against its fixed code table.
 """
 import dataclasses
+import datetime
+import math
 
 from lifemate_cloud.batch import BatchJobSpec
 from lifemate_cloud.errors import Conflict, IncompleteManifest, InvalidTransition, ManifestConflict
@@ -23,6 +25,23 @@ from lifemate_cloud.run import RunState
 from .errors import AmbiguousOutcome, LedgerOverflow, code_for
 from .records import AdmissionSlot, RunOp, RunOpState
 from .store import InMemoryManifestStore
+
+
+def _accepted_timestamp(value):
+    """Decode API UTC ISO timestamps while retaining numeric-seconds fixtures."""
+    try:
+        try:
+            seconds = float(value)
+        except (TypeError, ValueError):
+            accepted = datetime.datetime.fromisoformat(value)
+            if accepted.utcoffset() != datetime.timedelta(0):
+                raise ValueError("accepted_at must be UTC")
+            seconds = accepted.timestamp()
+        if not math.isfinite(seconds):
+            raise ValueError("accepted_at must be finite")
+        return seconds
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise IncompleteManifest("accepted_at must be UTC ISO 8601 or numeric seconds") from exc
 
 
 @dataclasses.dataclass(frozen=True)
@@ -223,7 +242,7 @@ class DispatchService:
             accepted_at = request.get("accepted_at")
             seconds = request.get("deadline_seconds")
         if accepted_at is not None:
-            return float(accepted_at) + float(
+            return _accepted_timestamp(accepted_at) + float(
                 seconds if seconds is not None else self.policy.deadline_seconds
             )
         try:
@@ -232,7 +251,7 @@ class DispatchService:
             accepted_at = None
         if accepted_at is not None:
             seconds = self.repository.deadline_seconds(run_id)
-            return float(accepted_at) + float(
+            return _accepted_timestamp(accepted_at) + float(
                 seconds if seconds is not None else self.policy.deadline_seconds
             )
         base = self._accepted_at.get(run_id)
