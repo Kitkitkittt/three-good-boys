@@ -1,0 +1,31 @@
+# Organizer data and competition artifacts are restricted to the registered team.
+/lifemate-handoff/
+/baseline/
+/organizer/
+/work/
+/outputs/
+/scripts/sdk_smoke.py
+
+# Implementer worktrees link to restricted local material.
+/.worktrees/
+
+# Local environments and Python-generated files.
+/.venv/
+__pycache__/
+*.py[cod]
+
+# Terraform state, credentials and operator-specific inputs are never committed.
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+*.tfvars
+*.tfvars.json
+*.tfbackend
+crash.log
+crash.*.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+gha-creds-*.json

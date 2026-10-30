@@ -1,0 +1,30 @@
+# Allowlist the public service sources. Private baseline/data/models, credentials,
+# Git history, local environments and build output never enter the root context.
+**
+!services/
+!services/lifemate_api/
+!services/lifemate_api/*.py
+!services/lifemate_api/requirements.txt
+!services/dispatcher/
+!services/dispatcher/*.py
+!services/lifemate_cloud/
+!services/lifemate_cloud/*.py
+!workers/
+!workers/__init__.py
+!workers/gpu_eval/
+!workers/gpu_eval/__init__.py
+!workers/gpu_eval/main.py
+!workers/gpu_eval/manifest.py
+!apps/
+!apps/web/
+!apps/web/package.json
+!apps/web/package-lock.json
+!apps/web/tsconfig.json
+!apps/web/next.config.ts
+!apps/web/src/
+!apps/web/src/**/
+!apps/web/src/**/*.ts
+!apps/web/src/**/*.tsx
+!apps/web/src/**/*.css
+!submission/
+!submission/Dockerfile

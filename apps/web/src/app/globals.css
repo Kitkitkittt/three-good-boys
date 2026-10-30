@@ -1,0 +1,138 @@
+:root {
+  color-scheme: light dark;
+  --fg: #1b1b1b;
+  --muted: #5c5c5c;
+  --bg: #ffffff;
+  --line: #d8d8d8;
+  --queued: #6b7280;
+  --submitting: #a16207;
+  --active: #1d4ed8;
+  --succeeded: #15803d;
+  --failed: #b91c1c;
+  --canceled: #4b5563;
+  font-family: ui-sans-serif, system-ui, sans-serif;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --fg: #e6e6e6;
+    --muted: #a3a3a3;
+    --bg: #101010;
+    --line: #333;
+  }
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  line-height: 1.5;
+}
+
+main {
+  max-width: 68rem;
+  margin: 0 auto;
+  padding: 1.5rem;
+}
+
+a {
+  color: inherit;
+}
+
+nav {
+  display: flex;
+  gap: 1rem;
+  border-bottom: 1px solid var(--line);
+  padding-bottom: 0.75rem;
+  margin-bottom: 1.5rem;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 0.75rem 0 1.5rem;
+}
+
+th,
+td {
+  text-align: left;
+  padding: 0.4rem 0.5rem;
+  border-bottom: 1px solid var(--line);
+  vertical-align: top;
+  font-size: 0.92rem;
+}
+
+th {
+  font-weight: 600;
+  color: var(--muted);
+}
+
+.badge {
+  display: inline-block;
+  padding: 0.05rem 0.45rem;
+  border-radius: 0.35rem;
+  color: #fff;
+  font-size: 0.8rem;
+  font-weight: 600;
+  background: var(--queued);
+}
+
+.badge.active {
+  background: var(--active);
+}
+.badge.submitting {
+  background: var(--submitting);
+}
+.badge.succeeded {
+  background: var(--succeeded);
+}
+.badge.failed {
+  background: var(--failed);
+}
+.badge.canceled {
+  background: var(--canceled);
+}
+
+.muted {
+  color: var(--muted);
+}
+
+.error {
+  border-left: 3px solid var(--failed);
+  padding: 0.25rem 0.75rem;
+  margin: 0.75rem 0;
+}
+
+.grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(18rem, 1fr));
+  gap: 1.25rem;
+}
+
+fieldset {
+  border: 1px solid var(--line);
+  border-radius: 0.4rem;
+  padding: 0.75rem;
+}
+
+label {
+  display: block;
+  margin: 0.4rem 0;
+}
+
+input,
+select,
+button {
+  font: inherit;
+  padding: 0.25rem 0.4rem;
+}
+
+button {
+  cursor: pointer;
+}
+
+code {
+  font-family: ui-monospace, monospace;
+  font-size: 0.85rem;
+  word-break: break-all;
+}
